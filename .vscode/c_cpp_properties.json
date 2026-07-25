@@ -1,0 +1,22 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/alientek/rk3568_sdk/kernel/arch/arm64/include", 
+                "/home/alientek/rk3568_sdk/kernel/include", 
+                "/home/alientek/rk3568_sdk/kernel/arch/arm64/include/generated",
+                "/home/alientek/rk3568_sdk/kernel/drivers/staging/android/uapi",
+                "./inc",
+                "/home/alientek/rk3568_sdk/external/mpp/inc"
+            ],
+            "defines": [],
+            "compilerPath": "/opt/atk-dlrk356x-toolchain/bin/aarch64-buildroot-linux-gnu-gcc",
+            "cStandard": "c17",
+            "cppStandard": "gnu++14",
+            "intelliSenseMode": "linux-gcc-x64"
+        }
+    ],
+    "version": 4
+}
