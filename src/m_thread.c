@@ -1,4 +1,9 @@
 #include"m_thread.h"
+#include <unistd.h>     /* dup() */
+
+
+
+
 void *thread_v4l2(void *argv)
 {
     AQueue *q= (AQueue*)argv;
@@ -86,11 +91,11 @@ static void qbuf_to_v4l2(AQueue *q, DmaBuffer pkt)
         perror("QBUF dmabuf");
 }
 
-void *thread_mpp(void *argv)
+void *thread_mpp_dec(void *argv)
 {
-    AQueue *q= (AQueue*)argv;
-    MppCtx ctx=NULL; 
-    MppApi *mpi=NULL;
+    AQueue *q = (AQueue*)argv;
+    MppCtx ctx = NULL; 
+    MppApi *mpi = NULL;
     MPP_RET ret;
 
     ret = mpp_create(&ctx, &mpi);
@@ -114,55 +119,58 @@ void *thread_mpp(void *argv)
     mpi->control(ctx, MPP_DEC_SET_CFG, cfg);
     mpp_dec_cfg_deinit(cfg);
 
-    /* 创建 buffer group 和输出 frame（MJPEG 必须用 MppTask API） */
-    MppBufferGroup frm_grp = NULL;
-    ret = mpp_buffer_group_get_internal(&frm_grp, MPP_BUFFER_TYPE_ION);
-    if (ret) {
-        fprintf(stderr, "mpp_buffer_group_get_internal failed %d\n", ret);
+    /* ========== NV12 输出 buffer 池（零拷贝到编码器） ========== */
+    RK_U32 hor_stride = MPP_ALIGN(1280, 64);   /* 1280 */
+    RK_U32 ver_stride = MPP_ALIGN(720, 64);     /* 768  */
+    size_t nv12_size  = hor_stride * ver_stride * 2;   /* ×4: MPP 硬件写帧可能溢出逻辑尺寸 */
+
+    int ion_fd = open("/dev/ion", O_RDWR);
+    if (ion_fd < 0) {
+        perror("open /dev/ion");
         mpp_destroy(ctx);
         return NULL;
     }
 
-    /* 1280x720 MJPEG 解码输出 NV12，申请足够大的 buffer */
+    DmaBuffer nv12_pool[NV12_BUF_NUM] = {0};
+    for (int i = 0; i < NV12_BUF_NUM; i++) {
+        nv12_pool[i].mxlen = nv12_size;
+        if (dma_ion_alloc(ion_fd, nv12_size, &nv12_pool[i]) < 0) {
+            dma_bufs_release(nv12_pool, i);
+            close(ion_fd);
+            mpp_destroy(ctx);
+            return NULL;
+        }
+    }
+    close(ion_fd);
+
+    /* 内部空闲队列 */
+    for (int i = 0; i < NV12_BUF_NUM; i++)
+        queue_push(q->free_nv12, &nv12_pool[i]);
+
+
+    /* 单个 MppFrame 描述符 — buffer 指针每帧切换，其他属性设一次 */
     MppFrame frame_out = NULL;
     ret = mpp_frame_init(&frame_out);
     if (ret) {
         fprintf(stderr, "mpp_frame_init failed %d\n", ret);
-        mpp_buffer_group_put(frm_grp);
+        dma_bufs_release(nv12_pool, NV12_BUF_NUM);
+        frame_queue_destroy(q->free_nv12);
         mpp_destroy(ctx);
         return NULL;
     }
+    mpp_frame_set_width(frame_out, 1280);
+    mpp_frame_set_height(frame_out, 720);
+    mpp_frame_set_hor_stride(frame_out, hor_stride);
+    mpp_frame_set_ver_stride(frame_out, ver_stride);
+    mpp_frame_set_fmt(frame_out, MPP_FMT_YUV420SP);
 
-    RK_U32 hor_stride = 1280;  /* MPP_ALIGN(width, 16) = 1280 */
-    RK_U32 ver_stride = 720;   /* MPP_ALIGN(height, 16) = 720 */
-    MppBuffer frm_buf = NULL;
-    ret = mpp_buffer_get(frm_grp, &frm_buf, hor_stride * ver_stride * 4);
-    if (ret) {
-        fprintf(stderr, "mpp_buffer_get failed %d\n", ret);
-        mpp_frame_deinit(frame_out);
-        mpp_buffer_group_put(frm_grp);
-        mpp_destroy(ctx);
-        return NULL;
-    }
-    mpp_frame_set_buffer(frame_out, frm_buf);
 
-    FILE *fp = fopen("frame.nv12", "wb");
-    if(!fp) {
-        perror("fopen");
-        mpp_buffer_put(frm_buf);
-        mpp_frame_deinit(frame_out);
-        mpp_buffer_group_put(frm_grp);
-        mpp_destroy(ctx);
-        return NULL;
-    }
-
-    while(g_running)
-    {
+    while (g_running) {
         DmaBuffer pkt;
-        if(queue_pop(q->input_q, &pkt) < 0)
+        if (queue_pop(q->input_q, &pkt) < 0)
             break;
 
-        /* 导入 V4L2 的 dmabuf 作为 MPP 输入 buffer */
+        /* ---- 导入 V4L2 的 MJPEG dmabuf 作为 MPP 输入 ---- */
         MppBufferInfo info = {
             .type = MPP_BUFFER_TYPE_ION,
             .fd   = pkt.dmabuf,
@@ -175,8 +183,7 @@ void *thread_mpp(void *argv)
             qbuf_to_v4l2(q, pkt);
             continue;
         }
-        
-        /* 创建 packet */
+
         MppPacket packet = NULL;
         ret = mpp_packet_init_with_buffer(&packet, buf);
         if (ret != MPP_OK) {
@@ -187,80 +194,101 @@ void *thread_mpp(void *argv)
         }
         mpp_packet_set_length(packet, pkt.reallen);
 
-        /* === MppTask 方式送帧 === */
+        /* ---- 从空闲池取一块 NV12 buffer 作为解码输出 ---- */
+        DmaBuffer nv12_out;
+        if (queue_pop(q->free_nv12, &nv12_out) < 0)
+            break;
+
+        /* dup() 后 import，确保 nv12_out.dmabuf fd 不被 MPP 关掉 */
+        int dup_fd = dup(nv12_out.dmabuf);
+        MppBufferInfo out_info = {
+            .type = MPP_BUFFER_TYPE_ION,
+            .fd   = dup_fd,
+            .size = nv12_out.mxlen,
+        };
+        MppBuffer out_buf = NULL;
+        ret = mpp_buffer_import(&out_buf, &out_info);
+        if (ret != MPP_OK) {
+            close(dup_fd);
+            fprintf(stderr, "mpp_buffer_import out %d\n", ret);
+            queue_push(q->free_nv12, &nv12_out);
+            goto cleanup_packet;
+        }
+        mpp_frame_set_buffer(frame_out, out_buf);
+
+        /* ---- MppTask 解码 ---- */
         MppTask task = NULL;
 
-        /* 等待 input 端口可用 */
         ret = mpi->poll(ctx, MPP_PORT_INPUT, MPP_POLL_BLOCK);
         if (ret) {
             fprintf(stderr, "mpp input poll failed %d\n", ret);
+            mpp_buffer_put(out_buf);
+            queue_push(q->free_nv12, &nv12_out);
             goto cleanup_packet;
         }
 
-        /* 从 input 队列取出一个 task */
         ret = mpi->dequeue(ctx, MPP_PORT_INPUT, &task);
         if (ret || !task) {
             fprintf(stderr, "mpp input dequeue failed %d\n", ret);
+            mpp_buffer_put(out_buf);
+            queue_push(q->free_nv12, &nv12_out);
             goto cleanup_packet;
         }
 
-        /* 设置 task 的输入 packet 和输出 frame */
         mpp_task_meta_set_packet(task, KEY_INPUT_PACKET, packet);
         mpp_task_meta_set_frame (task, KEY_OUTPUT_FRAME,  frame_out);
 
-        /* 提交 task */
         ret = mpi->enqueue(ctx, MPP_PORT_INPUT, task);
         if (ret) {
             fprintf(stderr, "mpp input enqueue failed %d\n", ret);
+            mpp_buffer_put(out_buf);
+            queue_push(q->free_nv12, &nv12_out);
             goto cleanup_packet;
         }
 
-        /* 等待 output 端口 */
         ret = mpi->poll(ctx, MPP_PORT_OUTPUT, MPP_POLL_BLOCK);
         if (ret) {
             fprintf(stderr, "mpp output poll failed %d\n", ret);
+            mpp_buffer_put(out_buf);
+            queue_push(q->free_nv12, &nv12_out);
             goto cleanup_packet;
         }
 
-        /* 从 output 队列取出完成后的 task */
         ret = mpi->dequeue(ctx, MPP_PORT_OUTPUT, &task);
         if (ret || !task) {
             fprintf(stderr, "mpp output dequeue failed %d\n", ret);
+            mpp_buffer_put(out_buf);
+            queue_push(q->free_nv12, &nv12_out);
             goto cleanup_packet;
         }
 
-        /* 获取解码后的 frame 并写入文件 */
-        {
-            MppFrame frame_ret = NULL;
-            mpp_task_meta_get_frame(task, KEY_OUTPUT_FRAME, &frame_ret);
-            if (frame_ret) {
-                MppBuffer buf_out = mpp_frame_get_buffer(frame_ret);
-                if (buf_out) {
-                    void *ptr = mpp_buffer_get_ptr(buf_out);
-                    size_t size = mpp_buffer_get_size(buf_out);
-                    fwrite(ptr, 1, size, fp);
-                }
-            }
-        }
 
-        /* 归还 output task */
         mpi->enqueue(ctx, MPP_PORT_OUTPUT, task);
 
-        /* 回收 input task 和 packet */
-        {
-            MppTask in_task = NULL;
-            mpi->dequeue(ctx, MPP_PORT_INPUT, &in_task);
-            if (in_task) {
-                MppPacket pkt_ret = NULL;
-                mpp_task_meta_get_packet(in_task, KEY_INPUT_PACKET, &pkt_ret);
-                if (pkt_ret)
-                    mpp_packet_deinit(&pkt_ret);
-                mpi->enqueue(ctx, MPP_PORT_INPUT, in_task);
-            }
-        }
-
-        mpp_buffer_put(buf);
+        /* ---- 清理 MJPEG 侧 MPP 资源 ---- */
+        mpp_packet_deinit(&packet);
+        mpp_buffer_put(buf);       /* 释放导入的 MJPEG buffer */
+        mpp_buffer_put(out_buf);   /* 释放 dup 的 fd；nv12_out.dmabuf 保持有效 */
         qbuf_to_v4l2(q, pkt);
+
+        /* ---- 把解码后的 NV12 dmabuf 推给编码器 ---- */
+        /*
+         * 零拷贝交接：
+         *   编码器从 q->out_q pop，编码完成后把 dmabuf fd 推回 free_nv12。
+         *   当前还没编码器，先自回收保持循环。
+         */
+        if (!nv12_out.start) {
+            nv12_out.mxlen = nv12_size;
+            buf_mmap(&nv12_out);
+        }
+        queue_push(q->out_q, &nv12_out);
+
+        /* 自回收 — 加编码器后删除此段 */
+        {
+            DmaBuffer recycled;
+            queue_pop(q->out_q, &recycled);
+            queue_push(q->free_nv12, &recycled);
+        }
         continue;
 
 cleanup_packet:
@@ -270,9 +298,9 @@ cleanup_packet:
     }
 
     fclose(fp);
-    mpp_buffer_put(frm_buf);
     mpp_frame_deinit(frame_out);
-    mpp_buffer_group_put(frm_grp);
+    dma_bufs_release(nv12_pool, NV12_BUF_NUM);
+    frame_queue_destroy(q->free_nv12);
     mpp_destroy(ctx);
     frame_queue_destroy(q->input_q);
     return NULL;

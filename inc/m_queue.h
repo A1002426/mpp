@@ -20,6 +20,7 @@ typedef struct
     Queue *input_q;
     Queue *done_q;
     Queue *out_q;
+    Queue *free_nv12;
     int fd;
 }AQueue;
 Queue *quenue_create(int mxsize);

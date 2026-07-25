@@ -10,7 +10,7 @@ int dma_ion_alloc(int ion_fd,size_t size, DmaBuffer *out)
     // ION 专属分配结构体，替换dma_heap结构体
     struct ion_allocation_data alloc = {
         .len = size,
-        .heap_id_mask =(1<<2), // 使用DMA堆
+        .heap_id_mask =(1<<1), // reserved heap (camera DMA 可用)
         .flags = 0,
     };
 
@@ -22,8 +22,6 @@ int dma_ion_alloc(int ion_fd,size_t size, DmaBuffer *out)
     }
     
     out->dmabuf = alloc.fd;
-    out->mxlen=0;
-    out->reallen=0;
     out->start=NULL;
     return 0;
 }
