@@ -14,26 +14,39 @@ void *thread_v4l2(void *argv)
     if(fd < 0)
     {
         perror("open v4l2 device");
+        frame_queue_stop(q->input_q);
         return NULL;
     }
     if(!capability(fd))
     {
         close(fd);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
     capfmt fmt_li={0};
     fs fs_li={0};
+    fi fi_li={0};
     fmt_li.pixelformat=V4L2_PIX_FMT_MJPEG;
-    fs_li.height=720;
-    fs_li.width=1280;
+    fs_li.height=HEIGHT;
+    fs_li.width=WIDTH;
+    fi_li.numerator=1;
+    fi_li.denominator=DENOMINATOR;
     if(!set_fmt(fd, &fmt_li, &fs_li))
     {
         close(fd);
+        frame_queue_stop(q->input_q);
+        return NULL;
+    }
+    if(!set_streamparm(fd, &fi_li))
+    {
+        close(fd);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
     if (!qbuf(fd, dma_bufs))
     {
         close(fd);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
 
@@ -42,11 +55,14 @@ void *thread_v4l2(void *argv)
     {
         perror("VIDIOC_STREAMON");  
         close(fd);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
     FILE *fp = fopen("frame.mjpg", "wb");
     if(!fp)    {
         perror("fopen");
+        close(fd);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
     while(g_running)
@@ -77,6 +93,7 @@ void *thread_v4l2(void *argv)
     fclose(fp);
     close(fd);
     dma_bufs_release(dma_bufs,BUF_NUM);
+    frame_queue_stop(q->input_q);
     return NULL;
 }
 /* 将 dmabuf 归还给 v4l2 */
@@ -101,6 +118,7 @@ void *thread_mpp_dec(void *argv)
     ret = mpp_create(&ctx, &mpi);
     if (ret != MPP_OK) {
         fprintf(stderr, "[ERR] mpp_create dec fail %d\n", ret);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
 
@@ -108,6 +126,7 @@ void *thread_mpp_dec(void *argv)
     if (ret != MPP_OK) {
         fprintf(stderr, "[ERR] mpp_init dec mjpeg fail %d\n", ret);
         mpp_destroy(ctx);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
 
@@ -120,14 +139,15 @@ void *thread_mpp_dec(void *argv)
     mpp_dec_cfg_deinit(cfg);
 
     /* ========== NV12 输出 buffer 池（零拷贝到编码器） ========== */
-    RK_U32 hor_stride = MPP_ALIGN(1280, 64);   /* 1280 */
-    RK_U32 ver_stride = MPP_ALIGN(720, 64);     /* 768  */
+    RK_U32 hor_stride = MPP_ALIGN(WIDTH, 64);   /* 1280 */
+    RK_U32 ver_stride = MPP_ALIGN(HEIGHT, 64);     /* 768  */
     size_t nv12_size  = hor_stride * ver_stride * 2;   /* ×4: MPP 硬件写帧可能溢出逻辑尺寸 */
 
     int ion_fd = open("/dev/ion", O_RDWR);
     if (ion_fd < 0) {
         perror("open /dev/ion");
         mpp_destroy(ctx);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
 
@@ -138,6 +158,7 @@ void *thread_mpp_dec(void *argv)
             dma_bufs_release(nv12_pool, i);
             close(ion_fd);
             mpp_destroy(ctx);
+            frame_queue_stop(q->input_q);
             return NULL;
         }
     }
@@ -156,6 +177,7 @@ void *thread_mpp_dec(void *argv)
         dma_bufs_release(nv12_pool, NV12_BUF_NUM);
         frame_queue_destroy(q->free_nv12);
         mpp_destroy(ctx);
+        frame_queue_stop(q->input_q);
         return NULL;
     }
     mpp_frame_set_width(frame_out, 1280);
@@ -282,13 +304,6 @@ void *thread_mpp_dec(void *argv)
             buf_mmap(&nv12_out);
         }
         queue_push(q->out_q, &nv12_out);
-
-        /* 自回收 — 加编码器后删除此段 */
-        {
-            DmaBuffer recycled;
-            queue_pop(q->out_q, &recycled);
-            queue_push(q->free_nv12, &recycled);
-        }
         continue;
 
 cleanup_packet:
@@ -297,11 +312,171 @@ cleanup_packet:
         qbuf_to_v4l2(q, pkt);
     }
 
-    fclose(fp);
     mpp_frame_deinit(frame_out);
     dma_bufs_release(nv12_pool, NV12_BUF_NUM);
-    frame_queue_destroy(q->free_nv12);
+    frame_queue_stop(q->free_nv12);
+    frame_queue_stop(q->out_q);
     mpp_destroy(ctx);
-    frame_queue_destroy(q->input_q);
+    return NULL;
+}
+void *thread_mpp_enc(void *argv)
+{
+    AQueue *q = (AQueue*)argv;
+    MppCtx ctx = NULL; 
+    MppApi *mpi = NULL;
+    MPP_RET ret;
+
+    ret = mpp_create(&ctx, &mpi);
+    if (ret != MPP_OK) {
+        fprintf(stderr, "[ERR] mpp_create enc fail %d\n", ret);
+        return NULL;
+    }
+
+    ret = mpp_init(ctx, MPP_CTX_ENC, MPP_VIDEO_CodingAVC);
+    if (ret != MPP_OK) {
+        fprintf(stderr, "[ERR] mpp_init enc avc fail %d\n", ret);
+        mpp_destroy(ctx);
+        return NULL;
+    }
+    MppEncCfg cfg = NULL;
+    mpp_enc_cfg_init(&cfg);
+
+    // 获取默认配置
+    mpi->control(ctx, MPP_ENC_GET_CFG, cfg);
+
+    // 基本参数：宽高、步幅、格式
+    mpp_enc_cfg_set_s32(cfg, "prep:width", WIDTH);
+    mpp_enc_cfg_set_s32(cfg, "prep:height", HEIGHT);
+    mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", MPP_ALIGN(WIDTH, 64));
+    mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", MPP_ALIGN(HEIGHT, 64));
+    mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV420SP);
+
+    // 编码器码流类型
+    mpp_enc_cfg_set_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_CBR);
+    mpp_enc_cfg_set_s32(cfg, "rc:bps", 2 * 1024 * 1024); // 2Mbps
+
+    // 设置 GOP 等（一般 30 帧一个 I 帧）
+    mpp_enc_cfg_set_s32(cfg, "split:mode", MPP_ENC_SPLIT_NONE);
+    mpp_enc_cfg_set_s32(cfg, "rc:gop", 30);
+
+
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", 30);
+    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", 1);
+
+    ret = mpi->control(ctx, MPP_ENC_SET_CFG, cfg);
+    if (ret != MPP_OK) {
+        fprintf(stderr, "MPP_ENC_SET_CFG failed\n");
+        mpp_enc_cfg_deinit(cfg);
+        mpp_destroy(ctx);
+        return NULL;
+    }
+    mpp_enc_cfg_deinit(cfg);
+    FILE *out_fp = fopen("output.h264", "wb");
+    if (!out_fp) {
+        fprintf(stderr, "fopen output.h264 failed\n");
+        mpp_destroy(ctx);
+        return NULL;
+    }
+    RK_U32 hor_stride = MPP_ALIGN(WIDTH, 16);   /* 1280 */
+    RK_U32 ver_stride = MPP_ALIGN(HEIGHT, 16);
+    size_t frame_size = MPP_ALIGN(hor_stride, 64) * MPP_ALIGN(ver_stride, 64) * 3 / 2;
+    MppBufferGroup buf_grp = NULL;
+    mpp_buffer_group_get_internal(buf_grp, MPP_BUFFER_TYPE_DRM);
+    MppBuffer buf = NULL;
+    mpp_buffer_get(buf_grp, &buf, frame_size);
+    
+    /* === 生成 H.264 头（SPS/PPS）=== */
+    {
+        MppPacket hdr = NULL;
+        mpp_packet_init_with_buffer(&hdr, buf);
+        mpp_packet_set_length(hdr, 0);
+        ret = mpi->control(ctx, MPP_ENC_GET_HDR_SYNC, hdr);
+        if (ret != MPP_OK || !hdr) {
+            fprintf(stderr, "[WARN] MPP_ENC_GET_HDR_SYNC ret=%d, hdr=%p\n", ret, hdr);
+        } else {
+            void *data = mpp_packet_get_data(hdr);
+            size_t len = mpp_packet_get_length(hdr);
+            if (data && len)
+                fwrite(data, 1, len, out_fp);
+            mpp_packet_deinit(&hdr);
+            mpp_buffer_put(buf);
+            buf = NULL;
+            mpp_buffer_group_put(buf_grp);
+            buf_grp = NULL;
+        }
+    }
+    MppFrame frame_out = NULL;
+    ret = mpp_frame_init(&frame_out);
+    if (ret) {
+        fprintf(stderr, "[ERR] mpp_frame_init failed %d\n", ret);
+        fclose(out_fp);
+        mpp_destroy(ctx);
+        return NULL;
+    }
+    mpp_frame_set_width(frame_out, WIDTH);
+    mpp_frame_set_height(frame_out, HEIGHT);
+    mpp_frame_set_hor_stride(frame_out, MPP_ALIGN(WIDTH, 64));
+    mpp_frame_set_ver_stride(frame_out, MPP_ALIGN(HEIGHT, 64));
+    mpp_frame_set_fmt(frame_out, MPP_FMT_YUV420SP);
+    
+    
+
+    while (g_running)
+    {
+        DmaBuffer nv12_in;
+        if (queue_pop(q->out_q, &nv12_in) < 0)
+            break;
+
+        /* dup() 后 import，确保 nv12_in.dmabuf fd 不被 MPP 关掉 */
+        int dup_fd = dup(nv12_in.dmabuf);
+        MppBufferInfo in_info = {
+            .type = MPP_BUFFER_TYPE_ION,
+            .fd   = dup_fd,
+            .size = nv12_in.mxlen,
+        };
+        MppBuffer in_buf = NULL;
+        ret = mpp_buffer_import(&in_buf, &in_info);
+        if (ret != MPP_OK) {
+            close(dup_fd);
+            fprintf(stderr, "mpp_buffer_import in %d\n", ret);
+            queue_push(q->free_nv12, &nv12_in);
+            continue;
+        }
+        
+
+        mpp_frame_set_buffer(frame_out, in_buf);
+
+
+        ret=mpi->encode_put_frame(ctx, frame_out);
+        if (ret!=MPP_OK) {
+            fprintf(stderr, "encode_put_frame failed %d\n", ret); 
+            mpp_buffer_put(in_buf);
+            queue_push(q->free_nv12, &nv12_in);
+            continue;   
+        }
+        MppPacket packet = NULL;
+        while(1)
+        {
+            ret=mpi->encode_get_packet(ctx, &packet);
+            if (ret == MPP_OK && packet) {
+                void *data = mpp_packet_get_data(packet);
+                size_t len = mpp_packet_get_length(packet);
+                if(data)
+                    fwrite(data, 1, len, out_fp);
+                mpp_packet_deinit(&packet);
+            } 
+            else
+            {
+                break;
+            }
+        }
+        mpp_buffer_put(in_buf);
+        queue_push(q->free_nv12, &nv12_in);
+
+    }
+    fclose(out_fp);
+    mpp_frame_deinit(frame_out);
+    mpp_destroy(ctx);
     return NULL;
 }

@@ -26,6 +26,7 @@ typedef struct
 Queue *quenue_create(int mxsize);
 int queue_push(Queue *q, const DmaBuffer *pkt);
 int queue_pop(Queue *q, DmaBuffer *pkt);
+void frame_queue_stop(Queue *q);
 void frame_queue_destroy(Queue *q);
 
 

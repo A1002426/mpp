@@ -5,6 +5,10 @@
 #include"m_queue.h"
 extern volatile int g_running;
 #define BUF_NUM 4
+#define NV12_BUF_NUM    4
+#define HEIGHT 720
+#define WIDTH 1280
+#define DENOMINATOR 30
 typedef struct 
 {
     unsigned int pixelformat;
